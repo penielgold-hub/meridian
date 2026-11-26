@@ -13,6 +13,7 @@
 #   STELLAR_NETWORK_FLAGS  Array of stellar-cli network flags, e.g.
 #                          (--network testnet) or
 #                          (--rpc-url "$RPC_URL" --network-passphrase "$NETWORK_PASSPHRASE").
+#   DEPLOYMENT_NETWORK     Manifest network key: testnet or mainnet.
 #   DEPLOYER               Stellar secret key/alias that funds and signs the
 #                          blend-adapter/mUSDC deploys.
 #   ADMIN_ADDRESS          Vault admin public key (G...).
@@ -46,7 +47,8 @@
 #
 # After sourcing, call deploy_vault_stack. It sets VAULT_ID, BLEND_ADAPTER_ID,
 # MUSDC_ID, and VAULT_INITIALIZED (1 if the vault itself was deployed this
-# run, 0 if the ADMIN_KEY-empty fallback above was taken) as globals.
+# run, 0 if the ADMIN_KEY-empty fallback above was taken) as globals. A
+# completed deployment also updates packages/shared/deployed-contracts.json.
 
 upload() {
   stellar contract upload "${STELLAR_NETWORK_FLAGS[@]}" --source "$DEPLOYER" --wasm "$1"
@@ -62,16 +64,97 @@ deploy() {
   local hash="$1"
   local salt="$2"
   local source="$3"
+  local stderr_file
+  local output
+  local contract_id
+  local transaction_hash
   shift 3
+  stderr_file=$(mktemp)
   if [ -n "$salt" ]; then
-    stellar contract deploy "${STELLAR_NETWORK_FLAGS[@]}" --source "$source" --wasm-hash "$hash" --salt "$salt" "$@"
+    if ! output=$(stellar contract deploy "${STELLAR_NETWORK_FLAGS[@]}" --source "$source" --wasm-hash "$hash" --salt "$salt" "$@" 2>"$stderr_file"); then
+      cat "$stderr_file" >&2
+      rm -f "$stderr_file"
+      return 1
+    fi
   else
-    stellar contract deploy "${STELLAR_NETWORK_FLAGS[@]}" --source "$source" --wasm-hash "$hash" "$@"
+    if ! output=$(stellar contract deploy "${STELLAR_NETWORK_FLAGS[@]}" --source "$source" --wasm-hash "$hash" "$@" 2>"$stderr_file"); then
+      cat "$stderr_file" >&2
+      rm -f "$stderr_file"
+      return 1
+    fi
   fi
+
+  cat "$stderr_file" >&2
+  contract_id=$(printf '%s\n' "$output" | sed -nE '/^C[A-Z2-7]{55}$/p' | tail -n 1)
+  transaction_hash=$(
+    {
+      printf '%s\n' "$output"
+      cat "$stderr_file"
+    } | sed -nE 's#.*\/tx\/([0-9a-fA-F]{64}).*#\1#p' | tail -n 1 | tr '[:upper:]' '[:lower:]'
+  )
+  rm -f "$stderr_file"
+  if [ -z "$contract_id" ] || [ -z "$transaction_hash" ]; then
+    echo "ERROR: stellar-cli did not return a contract ID and deployment transaction hash." >&2
+    return 1
+  fi
+  printf '%s|%s\n' "$contract_id" "$transaction_hash"
 }
 
 deploy_vault_stack() {
-  cd "$(dirname "${BASH_SOURCE[0]}")/../../packages/contracts"
+  local repo_root
+  repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+  : "${DEPLOYMENT_NETWORK:?DEPLOYMENT_NETWORK must be testnet or mainnet}"
+  if [ "$DEPLOYMENT_NETWORK" != "testnet" ] && [ "$DEPLOYMENT_NETWORK" != "mainnet" ]; then
+    echo "ERROR: DEPLOYMENT_NETWORK must be testnet or mainnet." >&2
+    return 1
+  fi
+
+  local expected_stellar_cli_version
+  expected_stellar_cli_version=$(node -e '
+    const fs = require("node:fs");
+    const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    process.stdout.write(manifest.toolchain.stellarCli);
+  ' "$repo_root/packages/shared/deployed-contracts.json")
+  local stellar_version_output
+  if ! stellar_version_output=$(stellar --version 2>&1); then
+    echo "ERROR: unable to read the installed Stellar CLI version." >&2
+    printf '%s\n' "$stellar_version_output" >&2
+    return 1
+  fi
+  local actual_stellar_cli_version
+  actual_stellar_cli_version=$(printf '%s\n' "$stellar_version_output" | sed -nE 's/^[^0-9]*([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
+  if [ "$actual_stellar_cli_version" != "$expected_stellar_cli_version" ]; then
+    echo "ERROR: deployment manifest requires Stellar CLI $expected_stellar_cli_version, but found: $stellar_version_output" >&2
+    return 1
+  fi
+
+  if [ -n "$(git -C "$repo_root" status --porcelain --untracked-files=all -- packages/contracts)" ]; then
+    echo "ERROR: packages/contracts has uncommitted changes; commit them before deployment." >&2
+    return 1
+  fi
+
+  local vault_salt="${VAULT_SALT:-$(openssl rand -hex 32)}"
+  local blend_adapter_salt="${BLEND_ADAPTER_SALT:-$(openssl rand -hex 32)}"
+  local musdc_salt="${MUSDC_SALT:-$(openssl rand -hex 32)}"
+  VAULT_ID=$(stellar contract id wasm "${STELLAR_NETWORK_FLAGS[@]}" --source-account "$ADMIN_ADDRESS" --salt "$vault_salt")
+  BLEND_ADAPTER_ID=$(stellar contract id wasm "${STELLAR_NETWORK_FLAGS[@]}" --source-account "$DEPLOYER_ADDRESS" --salt "$blend_adapter_salt")
+  MUSDC_ID=$(stellar contract id wasm "${STELLAR_NETWORK_FLAGS[@]}" --source-account "$DEPLOYER_ADDRESS" --salt "$musdc_salt")
+
+  local zero_account="GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+  local address
+  for address in "$ADMIN_ADDRESS" "$USDC_ID" "$TREASURY_ADDRESS" "$BLEND_POOL_ID"; do
+    if [[ ! "$address" =~ ^[GC][A-Z2-7]{55}$ ]] || [ "$address" = "$zero_account" ]; then
+      echo "ERROR: invalid or zero deployment address: $address" >&2
+      return 1
+    fi
+  done
+  if [ "$ADMIN_ADDRESS" = "$VAULT_ID" ] || [ "$USDC_ID" = "$VAULT_ID" ] ||
+    [ "$TREASURY_ADDRESS" = "$VAULT_ID" ] || [ "$BLEND_ADAPTER_ID" = "$VAULT_ID" ] ||
+    [ "$MUSDC_ID" = "$VAULT_ID" ]; then
+    echo "ERROR: admin, USDC, mUSDC, adapter, and treasury must not alias the vault address ($VAULT_ID)." >&2
+    return 1
+  fi
+  cd "$repo_root/packages/contracts"
   # SKIP_BUILD lets a caller drop in WASM already verified elsewhere (e.g. a
   # genuine Linux CI build, downloaded to sidestep `stellar contract build`'s
   # non-reproducibility across platforms) without this rebuilding over it
@@ -120,9 +203,9 @@ deploy_vault_stack() {
   # and mUSDC deploys already on-chain from the failed run stay usable
   # instead of being orphaned. Always echoed below so it can be recovered
   # from terminal scrollback even if the caller didn't set it.
-  local vault_salt="${VAULT_SALT:-$(openssl rand -hex 32)}"
-  VAULT_ID=$(stellar contract id wasm "${STELLAR_NETWORK_FLAGS[@]}" --source-account "$ADMIN_ADDRESS" --salt "$vault_salt")
   echo "VAULT_SALT (save this: re-run with VAULT_SALT=$vault_salt to resume at the same address if this run fails partway): $vault_salt"
+  echo "BLEND_ADAPTER_SALT: $blend_adapter_salt"
+  echo "MUSDC_SALT: $musdc_salt"
   echo "Reserved vault contract ID: $VAULT_ID"
 
   # The adapter's vault/pool/USDC wiring is passed as constructor arguments,
@@ -130,8 +213,11 @@ deploy_vault_stack() {
   # deliberately no separate initialize() step: that gap was front-runnable
   # (#505).
   echo "Deploying blend-adapter (vault=$VAULT_ID, pool=$BLEND_POOL_ID, usdc=$USDC_ID)..."
-  BLEND_ADAPTER_ID=$(deploy "$blend_adapter_hash" "" "$DEPLOYER" \
-    -- --vault "$VAULT_ID" --pool "$BLEND_POOL_ID" --usdc "$USDC_ID")
+  local blend_adapter_result
+  local blend_adapter_tx
+  blend_adapter_result=$(deploy "$blend_adapter_hash" "$blend_adapter_salt" "$DEPLOYER" \
+    -- --vault "$VAULT_ID" --pool "$BLEND_POOL_ID" --usdc "$USDC_ID") || return 1
+  IFS='|' read -r BLEND_ADAPTER_ID blend_adapter_tx <<< "$blend_adapter_result"
   echo "blend-adapter contract ID: $BLEND_ADAPTER_ID"
 
   # mUSDC (#578) is a custom SEP-41 token, not a Stellar Asset Contract: it
@@ -143,9 +229,45 @@ deploy_vault_stack() {
   # deploy-then-initialize gap would be front-runnable the same way #505's
   # adapter gap was.
   echo "Deploying mUSDC token (admin=$VAULT_ID)..."
-  MUSDC_ID=$(deploy "$musdc_token_hash" "" "$DEPLOYER" \
-    -- --admin "$VAULT_ID" --decimals 7 --name "Meridian USDC" --symbol mUSDC)
+  local musdc_result
+  local musdc_tx
+  musdc_result=$(deploy "$musdc_token_hash" "$musdc_salt" "$DEPLOYER" \
+    -- --admin "$VAULT_ID" --decimals 7 --name "Meridian USDC" --symbol mUSDC) || return 1
+  IFS='|' read -r MUSDC_ID musdc_tx <<< "$musdc_result"
   echo "mUSDC contract ID: $MUSDC_ID"
+
+  # Read back the deployed wiring before submitting the vault transaction.
+  # This prevents a fee-spending mismatch from reaching the vault deploy.
+  local adapter_usdc
+  local adapter_vault
+  local musdc_admin
+  if ! adapter_usdc=$(stellar contract invoke "${STELLAR_NETWORK_FLAGS[@]}" --source "$DEPLOYER" \
+    --id "$BLEND_ADAPTER_ID" -- get_usdc 2>&1 | tr -d '[:space:]"\r'); then
+    echo "ERROR: unable to read the deployed adapter USDC binding." >&2
+    return 1
+  fi
+  if ! adapter_vault=$(stellar contract invoke "${STELLAR_NETWORK_FLAGS[@]}" --source "$DEPLOYER" \
+    --id "$BLEND_ADAPTER_ID" -- get_vault 2>&1 | tr -d '[:space:]"\r'); then
+    echo "ERROR: unable to read the deployed adapter vault binding." >&2
+    return 1
+  fi
+  if ! musdc_admin=$(stellar contract invoke "${STELLAR_NETWORK_FLAGS[@]}" --source "$DEPLOYER" \
+    --id "$MUSDC_ID" -- admin 2>&1 | tr -d '[:space:]"\r'); then
+    echo "ERROR: unable to read the deployed mUSDC admin." >&2
+    return 1
+  fi
+  if [[ "$adapter_usdc" != *"$USDC_ID"* ]]; then
+    echo "ERROR: adapter USDC binding mismatch: expected $USDC_ID, got $adapter_usdc." >&2
+    return 1
+  fi
+  if [[ "$adapter_vault" != *"$VAULT_ID"* ]]; then
+    echo "ERROR: adapter vault binding mismatch: expected $VAULT_ID, got $adapter_vault." >&2
+    return 1
+  fi
+  if [[ "$musdc_admin" != *"$VAULT_ID"* ]]; then
+    echo "ERROR: mUSDC admin mismatch: expected $VAULT_ID, got $musdc_admin." >&2
+    return 1
+  fi
 
   # Deploying with the same salt used to reserve VAULT_ID above lands the
   # vault at that exact address. Its constructor sets
@@ -157,8 +279,11 @@ deploy_vault_stack() {
   if [ -n "$ADMIN_KEY" ]; then
     echo "Deploying vault (admin=$ADMIN_ADDRESS, treasury=$TREASURY_ADDRESS, usdc=$USDC_ID, musdc=$MUSDC_ID, adapter=$BLEND_ADAPTER_ID)..."
     local actual_vault_id
-    actual_vault_id=$(deploy "$vault_hash" "$vault_salt" "$ADMIN_KEY" \
-      -- --admin "$ADMIN_ADDRESS" --usdc "$USDC_ID" --musdc "$MUSDC_ID" --adapter "$BLEND_ADAPTER_ID" --treasury "$TREASURY_ADDRESS")
+    local vault_result
+    local vault_tx
+    vault_result=$(deploy "$vault_hash" "$vault_salt" "$ADMIN_KEY" \
+      -- --admin "$ADMIN_ADDRESS" --usdc "$USDC_ID" --musdc "$MUSDC_ID" --adapter "$BLEND_ADAPTER_ID" --treasury "$TREASURY_ADDRESS") || return 1
+    IFS='|' read -r actual_vault_id vault_tx <<< "$vault_result"
 
     # blend-adapter and mUSDC above were already deployed with VAULT_ID
     # baked permanently into their constructor state, and neither has an
@@ -174,6 +299,13 @@ deploy_vault_stack() {
     fi
     echo "vault contract ID: $VAULT_ID"
     VAULT_INITIALIZED=1
+
+    "$repo_root/node_modules/.bin/tsx" "$repo_root/scripts/write-deployment-manifest.ts" \
+      --network "$DEPLOYMENT_NETWORK" \
+      --vault-address "$VAULT_ID" --vault-hash "$vault_hash" --vault-salt "$vault_salt" --vault-tx "$vault_tx" \
+      --blend-address "$BLEND_ADAPTER_ID" --blend-hash "$blend_adapter_hash" --blend-salt "$blend_adapter_salt" --blend-tx "$blend_adapter_tx" \
+      --musdc-address "$MUSDC_ID" --musdc-hash "$musdc_token_hash" --musdc-salt "$musdc_salt" --musdc-tx "$musdc_tx" \
+      --admin "$ADMIN_ADDRESS" --treasury "$TREASURY_ADDRESS" --usdc "$USDC_ID" --blend-pool "$BLEND_POOL_ID"
   else
     # ADMIN is separate from DEPLOYER and ADMIN_KEY was not supplied, so
     # this run has no key that can source the vault's deploy transaction
